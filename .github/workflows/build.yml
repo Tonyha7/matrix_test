@@ -1,0 +1,155 @@
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build
+
+on:
+  # Runs on manual trigger.
+  workflow_dispatch:
+    inputs:
+
+
+# NOTE: The versions of the software we build are stored in versions.txt.
+
+# By default, run all commands in a bash shell.  On Windows, the default would
+# otherwise be powershell.  Each shell command should begin with "set -e" (to
+# make any failed command fail the script immediately) and "set -x" (to log
+# what commands are being run).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Configure the build matrix based on inputs.  The list of objects in the
+  # build matrix contents can't be changed by conditionals, but it can be
+  # computed by another job and deserialized.
+  matrix_config:
+    runs-on: ubuntu-latest
+    outputs:
+      MATRIX: ${{ steps.configure.outputs.MATRIX }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo-src
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Configure Build Matrix
+        id: configure
+        shell: node {0}
+        run: |
+          const fs = require('fs');
+
+          // Use enableSelfHosted to decide what the build matrix below should
+          // include.
+          const buildMatrix = JSON.parse(fs.readFileSync("${{ github.workspace }}/repo-src/build-matrix.json"));
+          const {hosted, selfHosted} = buildMatrix;
+          const matrix = hosted;
+
+          // Output a JSON object consumed by the build matrix below.
+          fs.appendFileSync(
+              process.env['GITHUB_OUTPUT'],
+              `MATRIX=${ JSON.stringify(matrix) }\n`);
+
+          // Log the outputs, for the sake of debugging this script.
+          console.log({matrix});
+
+  # On several different hosts, build ffmpeg's dependencies, then ffmpeg itself.
+  # The deps are all built as static libraries.
+  build:
+    needs: matrix_config
+    strategy:
+      # Let other matrix entries complete, so we have all results on failure
+      # instead of just the first failure.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix_config.outputs.MATRIX) }}
+
+    name: Build ${{ matrix.os_name }} ${{ matrix.target_arch }} ${{ matrix.container }}
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container }}
+      # Access to the host filesystem is required to patch the environment for
+      # Alpine Linux support.  See the first Alpine step below for details.
+      volumes:
+        - /:/host
+
+    steps:
+      - name: Add msys2 to the Windows path
+        if: runner.os == 'Windows'
+        run: |
+          # At this point, we're running Git Bash.  After this step, we will be
+          # running msys bash, just as we would be when debugging via SSH with
+          # mxschmitt/action-tmate.
+          echo "C:\\msys64\\usr\\bin" >> "$GITHUB_PATH"
+          echo "C:\\msys64\\mingw64\\bin" >> "$GITHUB_PATH"
+
+      # This is how we convince GitHub Actions Runner to run an Alpine Linux
+      # container.  We have to mask the fact that it's Alpine, install NodeJS,
+      # then patch the Alpine version of NodeJS in over the one that ships with
+      # GitHub Actions.  This is because GitHub doesn't officially support
+      # Alpine and because they hard-code the path to NodeJS in Node-based
+      # actions.
+      # See https://github.com/actions/runner/issues/801#issuecomment-2394425757
+      - name: Patch native Alpine NodeJS into Runner environment
+        if: startsWith(matrix.container, 'alpine')
+        run: |
+          apk add nodejs
+          sed -i "s:^ID=alpine:ID=NotpineForGHA:" /etc/os-release
+          # The first path here is for GitHub-hosted workflows, while the
+          # second path is correct for our self-hosted workflows using the
+          # myoung34/github-runner container.  The commands that follow this
+          # are correct so long as one of these paths exists.
+          cd /host/home/runner/runners/*/externals/ || cd /host/actions-runner/externals
+          rm -rf node20/*
+          mkdir node20/bin
+          ln -s /usr/bin/node node20/bin/node
+        shell: sh  # No bash in Alpine by default
+
+      - name: Install Alpine Linux deps
+        if: startsWith(matrix.container, 'alpine')
+        run: apk add bash npm sudo
+        shell: sh  # No bash in Alpine until after this command
+
+      - name: Install Ubuntu Linux deps
+        if: startsWith(matrix.container, 'ubuntu')
+        # Sudo is needed by the first build script, but isn't in the default
+        # container image for Ubuntu.
+        run: apt -y update && apt -y upgrade && apt -y install sudo
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo-src
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Prepare assets
+        run: |
+          set -e
+          set -x
+
+          mkdir assets
+          SUFFIX="-${{ matrix.os_name }}-${{ matrix.target_arch }}${{ matrix.exe_ext}}"
+          echo "SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+          cd assets
+          echo "$SUFFIX" > run.txt
+
+
+      # This makes it possible to debug failures in the next step by
+      # downloading binaries that fail the check for static linkage.
+      - name: Upload assets as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SUFFIX }}
+          path: assets/*
